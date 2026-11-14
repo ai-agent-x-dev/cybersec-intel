@@ -1,0 +1,10 @@
+# secrets and local state - never commit
+.env
+.cache.json
+.state.json
+*.tmp
+exports/
+
+# python
+__pycache__/
+*.pyc
