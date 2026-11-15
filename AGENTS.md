@@ -7,7 +7,7 @@ Quick reference for AI agents working on this project. Read this before touching
 | | |
 |---|---|
 | What | Terminal threat-intel tool: feeds, indicator lookups, passive site check, CVE → exploit search |
-| Version | 1.2.0 (`VERSION` in `intel.py`; keep `CHANGELOG.md` and `README.md` in step) |
+| Version | 1.3.0 (`VERSION` in `intel.py`; keep `CHANGELOG.md` and `README.md` in step) |
 | Code | one file, `intel.py`, Python 3.9+, standard library only |
 | Run | `python3 intel.py` (interactive) or `python3 intel.py --help` (one-shot modes) |
 | Keys | `.env` beside `intel.py`; template in `.env.example` |
@@ -54,6 +54,9 @@ Everything is in `intel.py`, in this order:
 - **Keys in URLs**: only a `key=` query parameter is redacted from the cache key. Prefer headers; if a service needs another parameter name, extend `RE_KEYPARAM`.
 - **Scores** only matter in the site check. A source used only in lookups should return score 0. The total is capped by `total_score()`.
 - **Row coloring** is driven by text patterns in `RE_POS_RED` / `RE_POS_YEL` (for example `Listed     YES`, `malicious:3`, `EXPLOIT` at end of line). Keep those phrasings when editing a source.
+- **Screen rows** are `(text, attr)`. For a row with more than one color, `text` is a `Seg([(piece, attr), ...])`; pass `pivot=False` for headings and notes so `Tab` never selects them. Draw only through `Tui.put()`.
+- **Glyphs** come from `pick_glyphs()` (UTF-8 or ASCII set). Never hard-code a box or block character.
+- **One-shot output** has two forms: `fancy()` is true on a terminal (rules, colors, meters), false when piped. The piped form is a stable format; do not change it.
 - **Remote text is untrusted.** `Res.lines()` and `unpack()` strip control characters; do not bypass them when printing.
 
 ## Adding a source

@@ -1,15 +1,31 @@
 # cybersec-intel
 
-**Version 1.2.0** · Python 3.9+ · MIT license · [Changelog](CHANGELOG.md)
+![version 1.3.0](https://img.shields.io/badge/version-1.3.0-39c5cf)
+![Python 3.9+](https://img.shields.io/badge/python-3.9%2B-3fb950)
+![dependencies: none](https://img.shields.io/badge/dependencies-none-3fb950)
+![license MIT](https://img.shields.io/badge/license-MIT-8b949e)
+[![changelog](https://img.shields.io/badge/changelog-read-8b949e)](CHANGELOG.md)
+
+![Lookup view: everything known about CVE-2021-44228](docs/lookup.png)
 
 A single-file terminal tool for threat intelligence: live threat feeds, indicator lookups, passive site reputation checks and CVE → exploit search. It runs as an interactive screen (TUI) or as one-shot commands, and uses only free API tiers and keyless services.
 
 All lookups are **passive**: the tool asks third-party engines about an indicator and never connects to the target itself.
 
+## Screens
+
+| Site check: passive verdict with a 0–100 score | Threat feed |
+|---|---|
+| ![Site check view](docs/site-check.png) | ![Threat feed view](docs/feed.png) |
+
+| Dashboard: keys loaded and today's quota | One-shot `--poc`: public PoCs and local exploits |
+|---|---|
+| ![Dashboard view](docs/dashboard.png) | ![--poc output in a terminal](docs/poc.png) |
+
 ## Requirements
 
 - Python 3.9+ (standard library only, no `pip install`)
-- Linux terminal with `curses` support
+- Linux terminal with `curses` support (a UTF-8 terminal gets rules, meters and a scrollbar; any other gets plain ASCII)
 - Optional, for local exploit search: `exploitdb` (searchsploit), `metasploit-framework`, `nuclei` templates — all present on Kali by default
 
 ## Install
@@ -119,6 +135,8 @@ cybersec-intel --prescan-file sites.txt          # bulk site check with summary 
 
 Exit code is `2` when a single indicator is rejected (unrecognized or private).
 
+On a terminal the one-shot output is colored and ruled like the interactive screen. Piped or redirected, it is the plain text it always was (`== source [status]` headers, no colors), so scripts keep working.
+
 ## What each lookup returns
 
 **IP** — Shodan host (services, versions, TLS, tags), Shodan InternetDB (ports, CVEs), AbuseIPDB (score, attack categories, latest reports), VirusTotal, ThreatFox, URLhaus, OTX pulses, OTX passive DNS and linked malware, RDAP network owner and abuse contact.
@@ -187,6 +205,7 @@ Signals include VirusTotal detections and categories, URLhaus and ThreatFox list
 | `.env.example` | key template; copy to `.env` |
 | `install.sh`, `uninstall.sh` | add / remove the `cybersec-intel` launcher |
 | `AGENTS.md` | quick reference for AI agents working on this code |
+| `docs/` | screenshots used in this README |
 | `CHANGELOG.md` | release notes |
 | `.env` | your API keys (git-ignored) |
 | `.cache.json` | response cache (git-ignored) |

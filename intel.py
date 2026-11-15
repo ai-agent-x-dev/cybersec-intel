@@ -8,9 +8,11 @@ import curses
 import datetime
 import ipaddress
 import json
+import locale
 import os
 import queue
 import re
+import shutil
 import sys
 import textwrap
 import threading
@@ -21,7 +23,7 @@ import urllib.request
 from collections import Counter, OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 ENV_FILE = os.path.join(APP_DIR, ".env")
@@ -2022,6 +2024,55 @@ def fail_text(exc):
 
 SPIN = "|/-\\"
 
+GLYPHS_UTF = {"rule": "\u2500", "full": "\u2588", "part": "\u2591", "ok": "\u25cf", "skip": "\u25cb",
+              "fail": "\u2716", "spin": "\u280b\u2819\u2839\u2838\u283c\u2834\u2826\u2827\u2807\u280f",
+              "sel": "\u25b6", "thumb": "\u2503", "track": "\u2502", "prompt": "\u276f",
+              "note": "\u25b8", "item": "\u2022"}
+GLYPHS_ASCII = {"rule": "-", "full": "#", "part": ".", "ok": "*", "skip": "o", "fail": "x",
+                "spin": SPIN, "sel": ">", "thumb": "#", "track": "|", "prompt": ">",
+                "note": "+", "item": "-"}
+TABS = ("Dashboard", "Feed", "Lookup", "Site check")
+HINTS = (("F1-4", "views"), ("Tab", "select"), ("Enter", "pivot"), ("^d", "deep"), ("^b", "back"),
+         ("r", "refresh"), ("^e", "csv"), ("^r", "report"), ("q", "quit"))
+RE_ITEM = re.compile(r"^(\s+)- ")
+LABELS = set()      # field labels seen in results, used to color the label column
+
+
+def note_labels(result):
+    if isinstance(result, Res):
+        LABELS.update(str(label).rstrip() for label, _v in result.fields)
+    return result
+
+
+def label_end(row):
+    """Length of the leading field label of a result row, or 0 when it has none."""
+    if len(row) > 10 and row[10] == " " and row[:10].rstrip() in LABELS:
+        return 11
+    for label in LABELS:
+        if len(label) > 10 and row.startswith(label + " "):
+            return len(label) + 1
+    return 0
+
+
+def pick_glyphs():
+    """Box and block characters on a UTF-8 terminal, plain ASCII anywhere else."""
+    try:
+        enc = locale.nl_langinfo(locale.CODESET)    # the terminal's real charset, which curses uses
+    except (AttributeError, locale.Error):
+        enc = locale.getpreferredencoding(False)
+    enc = (enc or "").lower().replace("-", "")
+    return GLYPHS_UTF if "utf8" in enc else GLYPHS_ASCII
+
+
+class Seg(str):
+    """Row text that also carries its colored pieces: a list of (text, attr)."""
+
+    def __new__(cls, segs, pivot=True):
+        self = super().__new__(cls, "".join(t for t, _ in segs))
+        self.segs = segs
+        self.pivot = pivot      # False: a heading or note, never a row to look up
+        return self
+
 EXPECTED = {"NVD": 6, "VirusTotal": 9, "AbuseIPDB": 6, "AlienVault OTX": 6,
             "OTX passive DNS": 14, "OTX CVE intel": 8, "Shodan host": 8,
             "Shodan InternetDB": 4, "Shodan CVEDB": 5, "CIRCL": 8,
@@ -2048,6 +2099,15 @@ class Tui:
                                 curses.COLOR_CYAN, curses.COLOR_MAGENTA, curses.COLOR_WHITE), 1):
             curses.init_pair(i, fg, -1)
         self.C_RED, self.C_YEL, self.C_GRN, self.C_CYN, self.C_MAG, self.C_WHT = range(1, 7)
+        # secondary text (rules, tracks, key hints): grey where the terminal has it
+        self.dim = curses.A_DIM
+        try:
+            if curses.COLORS >= 16:
+                curses.init_pair(7, 8, -1)
+                self.dim = curses.color_pair(7)
+        except curses.error:
+            pass
+        self.g = pick_glyphs()
         self.view = 0
         self.offset = 0
         self.buf = ""
@@ -2103,7 +2163,7 @@ class Tui:
 
     def _worker(self, bucket, title, fn):
         try:
-            score, lines, _raw = unpack(fn())
+            score, lines, _raw = unpack(note_labels(fn()))
             self.q.put((bucket, title, "ok", lines, score))
         except Skip as exc:
             self.q.put((bucket, title, "skip", [str(exc)], 0))
@@ -2164,83 +2224,144 @@ class Tui:
         for t, fn in jobs:
             threading.Thread(target=self._worker, args=("scan", t, fn), daemon=True).start()
 
+    def width(self):
+        return max(min(self.scr.getmaxyx()[1] - 4, 100), 20)
+
+    def heading(self, title, badge="", badge_attr=0):
+        """Section title on a rule: -- title  badge ------"""
+        g = self.g
+        segs = [(g["rule"] * 2 + " ", self.dim), (title, curses.A_BOLD)]
+        if badge:
+            segs += [("  ", 0), (badge, badge_attr)]
+        used = sum(len(t) for t, _ in segs)
+        segs.append((" " + g["rule"] * max(self.width() - used - 1, 2), self.dim))
+        return (Seg(segs, pivot=False), 0)
+
+    def bar(self, part, whole, cells):
+        """(filled, empty) strings for a meter; anything above zero shows one cell."""
+        n = 0 if whole <= 0 else min(int(part * cells / whole), cells)
+        if part > 0 and n == 0:
+            n = 1
+        return self.g["full"] * n, self.g["part"] * (cells - n)
+
+    def help_line(self, text):
+        key, sep, rest = text.partition(": ")
+        if not sep:
+            return (f"  {text}", self.attr(self.C_WHT))
+        return (Seg([(f"  {key:<11}", self.attr(self.C_CYN)), (rest, self.attr(self.C_WHT))]), 0)
+
     def dash_lines(self):
-        lines = [(f"CYBERSEC THREAT INTEL  v{VERSION}", self.attr(self.C_CYN, True)), ("", 0)]
+        g = self.g
+        lines = [(f"CYBERSEC THREAT INTEL  v{VERSION}", self.attr(self.C_CYN, True)),
+                 ("passive lookups only, free API tiers, nothing touches the target", self.dim),
+                 ("", 0), self.heading("Sources")]
         for var, name in SOURCES:
             if ENV.get(var):
-                lines.append((f"  [ok]   {name:<34} key loaded", self.attr(self.C_GRN)))
+                lines.append((Seg([(f"  {g['ok']} ", self.attr(self.C_GRN, True)), (f"{name:<36}", 0),
+                                   ("key loaded", self.attr(self.C_GRN))]), 0))
             else:
-                lines.append((f"  [--]   {name:<34} no key, source skipped", self.attr(self.C_YEL)))
-        lines += [("", 0),
-                  ("views: [F1] dash  [F2] feed  [F3] lookup  [F4] site check", self.attr(self.C_WHT)),
-                  ("lookup: IP | domain | URL | hash | CVE | PYSEC | GHSA", self.attr(self.C_WHT)),
-                  ("CVE lookup adds PoC search: GitHub, Exploit-DB, Metasploit, Nuclei, OTX", self.attr(self.C_WHT)),
-                  ("IP lookup marks CVEs that have a local exploit [msf edb nuclei]", self.attr(self.C_WHT)),
-                  ("pivot: Tab selects a row with an IP/domain/hash/CVE, Enter looks it up, ^b goes back", self.attr(self.C_WHT)),
-                  ("deep: ^d in lookup adds VirusTotal relations/sandbox + AbuseIPDB /24 (uses quota)", self.attr(self.C_WHT)),
-                  ("paste: ctrl+shift+v   copy: select text + ctrl+shift+c", self.attr(self.C_WHT)),
-                  ("export csv: ^e    save report: ^r (lookup & site check)", self.attr(self.C_WHT)),
-                  ("arrows: <-> switch tabs   up/down scroll   numpad 4/6/8/2 works too", self.attr(self.C_WHT)),
-                  ("keys are read from the .env file beside this script", self.attr(self.C_WHT)),
-                  (quota_summary(), self.attr(self.C_CYN)),
-                  ("rate limits + daily quotas + per-source cache (30min-12h) enforced", self.attr(self.C_YEL))]
+                lines.append((Seg([(f"  {g['skip']} ", self.attr(self.C_YEL)), (f"{name:<36}", self.dim),
+                                   ("no key, source skipped", self.attr(self.C_YEL))]), 0))
+        lines += [("", 0), self.heading("Quota today")]
+        counts = load_state().get("counts", {})
+        metered = [n for n in DAILY_LIMITS if ENV.get(QUOTA_VAR[n])]
+        for name in metered:
+            used, limit = counts.get(name, 0), DAILY_LIMITS[name]
+            pair = self.C_RED if used >= limit * 0.9 else self.C_YEL if used >= limit * 0.7 else self.C_GRN
+            full, empty = self.bar(used, limit, 24)
+            lines.append((Seg([(f"  {name:<18}", 0), (full, self.attr(pair)), (empty, self.dim),
+                               (f"  {used}/{limit}", self.attr(pair) if used else self.dim)]), 0))
+        if not metered:
+            lines.append(("  no metered keys", self.dim))
+        lines += [("", 0), self.heading("Help")]
+        lines += [self.help_line(t) for t in (
+            "views: [F1] dash  [F2] feed  [F3] lookup  [F4] site check",
+            "lookup: IP | domain | URL | hash | CVE | PYSEC | GHSA",
+            "CVE: lookup adds PoC search: GitHub, Exploit-DB, Metasploit, Nuclei, OTX",
+            "IP: lookup marks CVEs that have a local exploit [msf edb nuclei]",
+            "pivot: Tab selects a row with an IP/domain/hash/CVE, Enter looks it up, ^b goes back",
+            "deep: ^d in lookup adds VirusTotal relations/sandbox + AbuseIPDB /24 (uses quota)",
+            "paste: ctrl+shift+v   copy: select text + ctrl+shift+c",
+            "export: csv ^e    save report ^r (lookup & site check)",
+            "arrows: <-> switch tabs   up/down scroll   numpad 4/6/8/2 works too",
+            "keys: read from the .env file beside this script",
+            "limits: rate limits + daily quotas + per-source cache (30min-12h) enforced")]
         return lines
 
-    def section(self, store, show_spin):
+    def row_line(self, row):
+        row = str(row)
+        attr = self.row_attr(row)
+        if row.startswith("+ "):
+            return (Seg([(f"   {self.g['note']} ", attr | curses.A_BOLD), (row[2:], attr)], pivot=False), attr)
+        if attr:
+            return (f"   {row}", attr)
+        m = RE_ITEM.match(row)
+        if m:
+            return (Seg([("   " + m.group(1), 0), (self.g["item"] + " ", self.dim), (row[m.end():], 0)]), 0)
+        n = label_end(row)
+        if n:
+            return (Seg([("   " + row[:n], self.attr(self.C_CYN)), (row[n:], 0)]), 0)
+        return (f"   {row}", 0)
+
+    def spinner(self):
+        spin = self.g["spin"]
+        return spin[int(time.time() * 8) % len(spin)]
+
+    def section(self, store, show_spin, verb="working"):
         lines = []
         if show_spin:
-            lines.append(("working...", self.attr(self.C_CYN, True)))
+            left = f"{show_spin} source{'s' if show_spin != 1 else ''} left"
+            lines.append((Seg([(f"{self.spinner()} {verb}", self.attr(self.C_CYN, True)),
+                               (f"  {left}", self.dim)], pivot=False), 0))
+            lines.append(("", 0))
+        cyan = self.attr(self.C_CYN, True)
         for title, entry in store.items():
             status, rows = entry[0], entry[1]
             if status == "running":
                 elapsed = time.time() - entry[2]
                 if elapsed >= 5:
                     pct = min(int(elapsed / EXPECTED.get(title, 10) * 100), 95)
-                    cells = "#" * (pct // 10) + "-" * (10 - pct // 10)
-                    head = f"-- {title} [{cells}] {pct:>3}% {elapsed:.0f}s"
+                    full, empty = self.bar(pct, 100, 10)
+                    lines.append(self.heading(title, f"{full}{empty} {pct:>3}% {elapsed:.0f}s", cyan))
                 else:
-                    ch = SPIN[int(time.time() * 4) % 4]
-                    head = f"-- {title} [{ch}] {elapsed:.0f}s"
-                attr = self.attr(self.C_CYN, True)
+                    lines.append(self.heading(title, f"{self.spinner()} {elapsed:.0f}s", cyan))
             else:
-                head = f"-- {title} [{status}]"
-                attr = self.status_attr(status) | curses.A_BOLD
-            lines.append((head, attr))
-            for r in rows:
-                lines.append((f"   {r}", self.row_attr(str(r))))
+                lines.append(self.heading(title, f"{self.g.get(status, '')} {status}".strip(),
+                                          self.status_attr(status) | curses.A_BOLD))
+            lines += [self.row_line(r) for r in rows]
             lines.append(("", 0))
         return lines
 
     def feed_lines(self):
-        return self.section(self.feed, self.feed_pending)
+        return self.section(self.feed, self.feed_pending, "loading feeds")
 
     def lookup_lines(self):
         if not self.results:
             return [("type or paste an indicator below, then press Enter", self.attr(self.C_WHT)),
-                    ("accepts: IP | domain | URL | hash | CVE | PYSEC | GHSA", self.attr(self.C_WHT))]
+                    ("accepts: IP | domain | URL | hash | CVE | PYSEC | GHSA", self.dim)]
         running = sum(1 for e in self.results.values() if e[0] == "running")
         return self.section(self.results, running)
 
     def sitecheck_lines(self):
         if not self.scans:
             return [("passive site reputation check - enter URL, domain or IP below", self.attr(self.C_WHT)),
-                    ("queries VT, URLhaus, ThreatFox, OTX, AbuseIPDB, Shodan, RDAP - never touches the target", self.attr(self.C_WHT)),
-                    ("examples: http://free-toolz.example | crack-site.example | 185.220.101.1", self.attr(self.C_WHT))]
+                    ("queries VT, URLhaus, ThreatFox, OTX, AbuseIPDB, Shodan, RDAP - never touches the target", self.dim),
+                    ("examples: http://free-toolz.example | crack-site.example | 185.220.101.1", self.dim)]
         lines = []
-        pending = any(e[0] == "running" for e in self.scans.values())
+        running = sum(1 for e in self.scans.values() if e[0] == "running")
         total = total_score(self.scan_scores.values())
-        if pending:
-            lines.append(("scoring...", self.attr(self.C_CYN, True)))
-        else:
+        if not running:
             label, pair = verdict_of(total)
             name = {"red": self.C_RED, "yel": self.C_YEL,
                     "mag": self.C_MAG, "grn": self.C_GRN}[pair]
-            lines.append((f"VERDICT: {label}   score {total}/100", self.attr(name, True)))
+            tone = self.attr(name, True)
+            full, empty = self.bar(total, 100, 40)
+            lines.append((Seg([("VERDICT: ", curses.A_BOLD), (label, tone)], pivot=False), 0))
+            lines.append((Seg([(full, tone), (empty, self.dim), (f"  score {total}/100", tone)], pivot=False), 0))
             contrib = ", ".join(f"{t} +{s}" for t, s in self.scan_scores.items() if s)
-            lines.append((f"contributors: {contrib or 'none'}", self.attr(self.C_WHT)))
+            lines.append((Seg([("contributors: ", self.attr(self.C_CYN)), (contrib or "none", 0)], pivot=False), 0))
             lines.append(("", 0))
-        running = sum(1 for e in self.scans.values() if e[0] == "running")
-        return lines + self.section(self.scans, running)
+        return lines + self.section(self.scans, running, "scoring")
 
     def pivot_cached(self, text, current):
         key = (text, current)
@@ -2356,15 +2477,14 @@ class Tui:
             scr.addnstr(0, 0, "terminal too small", max(w - 1, 0))
             scr.refresh()
             return
-        scr.addnstr(0, 0, " CYBERSEC INTEL ".ljust(w), w - 1, self.attr(self.C_CYN, True))
-        scr.addnstr(0, w - 9, time.strftime("%H:%M:%S"), 8, self.attr(self.C_WHT))
+        self.draw_header(w)
         body = (self.dash_lines, self.feed_lines, self.lookup_lines, self.sitecheck_lines)[self.view]()
         avail = h - 4 - (1 if self.view in (2, 3) else 0)
         current = {2: self.last_query, 3: self.last_scan}.get(self.view)
         self.pivots, self.targets = [], []
         if self.view in (1, 2, 3):
             for i, (text, _a) in enumerate(body):
-                target = self.pivot_cached(str(text), current)
+                target = self.pivot_cached(str(text), current) if getattr(text, "pivot", True) else None
                 if target:
                     self.pivots.append(i)
                     self.targets.append(target)
@@ -2383,17 +2503,63 @@ class Tui:
         self.clamp_offset(len(body), max(avail, 1))
         for i, (text, a) in enumerate(body[self.offset:self.offset + max(avail, 0)]):
             if self.offset + i == chosen:
-                scr.addnstr(2 + i, 0, "> " + str(text).ljust(w), w - 1, curses.A_REVERSE | curses.A_BOLD)
+                self.put(2 + i, 0, [((self.g["sel"] + " " + str(text)).ljust(w),
+                                     curses.A_REVERSE | curses.A_BOLD)], w - 1)
+            elif isinstance(text, Seg):
+                self.put(2 + i, 2, text.segs, w - 3)
             else:
-                scr.addnstr(2 + i, 2, str(text), w - 3, a)
+                self.put(2 + i, 2, [(str(text), a)], w - 3)
+        self.draw_scrollbar(len(body), max(avail, 0), w)
         if self.view in (2, 3):
-            prefix = "save report to: " if self.prompting else "> "
-            scr.addnstr(h - 3, 0, (prefix + self.buf + "_").ljust(w), w - 1,
-                        self.attr(self.C_CYN if self.prompting else self.C_GRN, True))
-        foot = "[F1-4]views  Tab select+Enter pivot  ^d deep  ^b back  r refresh  ^e csv  ^r report  q quit"
-        scr.addnstr(h - 2, 0, foot.ljust(w), w - 1, curses.A_REVERSE)
-        scr.addnstr(h - 1, 0, self.msg[-(w - 1):], w - 1, self.attr(self.C_YEL))
+            prefix = "save report to: " if self.prompting else self.g["prompt"] + " "
+            self.put(h - 3, 0, [(prefix, self.attr(self.C_CYN if self.prompting else self.C_GRN, True)),
+                                (self.buf, curses.A_BOLD), (" ", curses.A_REVERSE)], w - 1)
+        bar = curses.A_REVERSE
+        foot = [(" ", bar)]
+        for key, what in HINTS:
+            foot += [(key, bar | curses.A_BOLD), (f" {what}   ", bar)]
+        foot.append((" " * w, bar))
+        self.put(h - 2, 0, foot, w - 1)
+        self.put(h - 1, 0, [(" " + self.msg[-(w - 2):], self.attr(self.C_YEL))], w - 1)
         scr.refresh()
+
+    def put(self, y, x, segs, room):
+        """Draw colored pieces left to right, cut at `room` columns."""
+        for text, a in segs:
+            if room <= 0:
+                break
+            text = text[:room]
+            try:
+                self.scr.addstr(y, x, text, a)
+            except curses.error:
+                pass
+            x += len(text)
+            room -= len(text)
+
+    def draw_header(self, w):
+        cyan = self.attr(self.C_CYN, True)
+        tabs = []
+        for i, name in enumerate(TABS):
+            if i == self.view:
+                tabs.append((f" F{i + 1} {name} ", cyan | curses.A_REVERSE))
+            else:
+                tabs += [(f" F{i + 1} ", self.dim), (f"{name} ", 0)]
+        size = sum(len(t) for t, _ in tabs)
+        brand = [(" CYBERSEC INTEL ", cyan), (" ", 0)] if w >= size + 18 else []
+        self.put(0, 0, brand + tabs, w - 1)
+        if w >= size + 18 + 10:
+            self.put(0, w - 9, [(time.strftime("%H:%M:%S"), self.dim)], 8)
+        self.put(1, 0, [(self.g["rule"] * w, self.dim)], w - 1)
+
+    def draw_scrollbar(self, total, avail, w):
+        if avail < 3 or total <= avail:
+            return
+        thumb = max(avail * avail // total, 1)
+        top = self.offset * (avail - thumb) // (total - avail)
+        for i in range(avail):
+            on = top <= i < top + thumb
+            self.put(2 + i, w - 1, [(self.g["thumb" if on else "track"],
+                                     self.attr(self.C_CYN) if on else self.dim)], 1)
 
     def _read_esc(self):
         seq = ""
@@ -2606,7 +2772,7 @@ class Tui:
 
 
 ANSI = {"red": "\033[31m", "yel": "\033[33m", "grn": "\033[32m",
-        "mag": "\033[35m", "cyn": "\033[36m", "b": "\033[1m", "o": "\033[0m"}
+        "mag": "\033[35m", "cyn": "\033[36m", "dim": "\033[90m", "b": "\033[1m", "o": "\033[0m"}
 ROW_ANSI = {"red": "red", "yel": "yel", "mag": "mag", "grn": "grn"}
 QUIET = False
 
@@ -2628,7 +2794,7 @@ def run_jobs(jobs):
     def one(item):
         t, fn = item
         try:
-            score, lines, data = unpack(fn())
+            score, lines, data = unpack(note_labels(fn()))
             res[t] = ("ok", lines, "grn", score)
             raw[t] = {"status": "ok", **data}
         except Skip as exc:
@@ -2643,11 +2809,55 @@ def run_jobs(jobs):
     return res, raw
 
 
+def fancy():
+    """Rules, meters and a colored label column: only when a person is reading a terminal."""
+    return sys.stdout.isatty() and not QUIET
+
+
+def pretty_row(row, g):
+    A = ANSI
+    color = A.get(ROW_ANSI.get(row_class(row)), "")
+    if row.startswith("+ "):
+        return f"   {A['b']}{color}{g['note']}{A['o']} {color}{row[2:]}{A['o']}"
+    if color:
+        return f"   {color}{row}{A['o']}"
+    m = RE_ITEM.match(row)
+    if m:
+        return f"   {m.group(1)}{A['dim']}{g['item']}{A['o']} {row[m.end():]}"
+    n = label_end(row)
+    if n:
+        return f"   {A['cyn']}{row[:n]}{A['o']}{row[n:]}"
+    return f"   {row}"
+
+
 def show_sections(res):
+    if not fancy():
+        for t, (status, rows, color, _s) in res.items():
+            out(f"\n== {t} [{status}]", color, True)
+            for r in rows:
+                out(f"  {r}", ROW_ANSI.get(row_class(str(r))))
+        return
+    A, g = ANSI, pick_glyphs()
+    width = max(min(shutil.get_terminal_size().columns - 2, 100), 20)
     for t, (status, rows, color, _s) in res.items():
-        out(f"\n== {t} [{status}]", color, True)
+        badge = f"{g.get(status, '')} {status}".strip()
+        fill = g["rule"] * max(width - len(t) - len(badge) - 6, 2)
+        print(f"\n{A['dim']}{g['rule'] * 2}{A['o']} {A['b']}{t}{A['o']}  "
+              f"{A['b']}{A.get(color, '')}{badge}{A['o']} {A['dim']}{fill}{A['o']}")
         for r in rows:
-            out(f"  {r}", ROW_ANSI.get(row_class(str(r))))
+            print(pretty_row(str(r), g))
+
+
+def show_verdict(label, color, total):
+    if not fancy():
+        out(f"\nVERDICT: {label}   score {total}/100", color, True)
+        return
+    A, g = ANSI, pick_glyphs()
+    cells = 40
+    n = min(int(total * cells / 100), cells) or (1 if total else 0)
+    tone = A["b"] + A.get(color, "")
+    print(f"\n{A['b']}VERDICT:{A['o']} {tone}{label}{A['o']}")
+    print(f"{tone}{g['full'] * n}{A['o']}{A['dim']}{g['part'] * (cells - n)}{A['o']}  {tone}score {total}/100{A['o']}")
 
 
 def record(ind, kind, res, raw, **extra):
@@ -2698,7 +2908,7 @@ def cli_prescan(raw_ind):
     scores = {t: e[3] for t, e in res.items() if e[0] == "ok"}
     total = total_score(scores.values())
     label, color = verdict_of(total)
-    out(f"\nVERDICT: {label}   score {total}/100", color, True)
+    show_verdict(label, color, total)
     contrib = ", ".join(f"{t} +{s}" for t, s in scores.items() if s)
     out(f"contributors: {contrib or 'none'}")
     return record(ind, f"site-check:{kind}", res, raw, verdict=label, score=total)
@@ -2715,6 +2925,10 @@ def read_indicators(path):
 
 
 def main():
+    try:
+        locale.setlocale(locale.LC_ALL, "")
+    except locale.Error:
+        pass
     global QUIET
     ap = argparse.ArgumentParser(prog="cybersec-intel",
                                  description="Minimal terminal window for cybersecurity threat intel.")

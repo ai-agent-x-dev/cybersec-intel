@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.3.0 — 2026-11-15
+
+Visual release: no new sources, options or output fields.
+
+### Changed
+- **Interactive screen**: tab strip with the active view highlighted, section headers on a rule with a status mark, field labels in their own color, bullets, a scrollbar when a view is longer than the window, and a footer with the keys in bold.
+- **Dashboard**: grouped into Sources, Quota today (one meter per metered service) and Help.
+- **Site check**: the verdict has a score bar.
+- **Progress**: smoother spinner, block progress bar, and a count of sources still running.
+- **One-shot commands** (`--lookup`, `--poc`, `--prescan`, `--feed`, bulk modes): same look when printing to a terminal. Piped or redirected output is unchanged.
+- Terminals that are not UTF-8 get an ASCII version of all of the above.
+
 ## 1.2.0 — 2026-11-13
 
 ### Added
